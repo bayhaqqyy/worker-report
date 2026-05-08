@@ -2,12 +2,12 @@
 """
 Collect OpenShift worker node resource usage and sync to Google Sheets.
 
-Each OCP cluster maps to a separate worksheet in the same spreadsheet.
-To add a new cluster, add an entry to the CLUSTERS dictionary below.
+Run this script on each OCP cluster and specify the target worksheet name.
+Each cluster writes to its own worksheet in the same spreadsheet.
 
 Usage:
-    python3 worker_report.py                 # default cluster (surr-sby)
-    python3 worker_report.py --cluster surr-sby
+    python3 worker_report.py --sheet "surr sby"
+    python3 worker_report.py --sheet "surr jkt"
 """
 
 import argparse
@@ -38,25 +38,6 @@ SCOPES = [
 
 SERVICE_ACCOUNT_FILE = "/home/ADMINISTRATOR/ivtsvc/worker-report/service-account.json"
 SPREADSHEET_ID = "1iU150fVgpwg9zbROho6UjB4p1kufCl7-hJUcnYLbfj8"
-
-# ---------------------------------------------------------------------------
-# Cluster registry - add new OCP clusters here
-# ---------------------------------------------------------------------------
-CLUSTERS: Dict[str, Dict[str, str]] = {
-    "surr-sby": {
-        "worksheet_name": "surr sby",
-        "description": "OCP Surabaya (SURR SBY)",
-    },
-    # Add more clusters as needed, for example:
-    # "surr-jkt": {
-    #     "worksheet_name": "surr jkt",
-    #     "description": "OCP Jakarta (SURR JKT)",
-    # },
-    # "surr-bali": {
-    #     "worksheet_name": "surr bali",
-    #     "description": "OCP Bali (SURR Bali)",
-    # },
-}
 
 # ---------------------------------------------------------------------------
 # Collection parameters
@@ -435,7 +416,6 @@ def sync_to_sheet(worksheet: gspread.Worksheet, data: List[List[str]]) -> None:
 def apply_sheet_formatting(worksheet: gspread.Worksheet) -> None:
     """Apply basic formatting: freeze first row area and auto-filter."""
     try:
-        total_rows = len(worksheet.get_all_values())
         worksheet.spreadsheet.batch_update(
             {
                 "requests": [
@@ -475,10 +455,9 @@ def apply_sheet_formatting(worksheet: gspread.Worksheet) -> None:
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
-def print_summary(cluster_desc: str, worksheet_name: str, node_count: int, pod_count: int) -> None:
+def print_summary(worksheet_name: str, node_count: int, pod_count: int) -> None:
     """Print a short run summary."""
     print("=" * 60)
-    print("Cluster     : {0}".format(cluster_desc))
     print("Worksheet   : {0}".format(worksheet_name))
     print("Worker Nodes: {0}".format(node_count))
     print("Total Pods  : {0}".format(pod_count))
@@ -496,19 +475,15 @@ def main() -> None:
         description="Collect OpenShift worker resource usage and sync to Google Sheets.",
     )
     parser.add_argument(
-        "--cluster",
-        choices=list(CLUSTERS.keys()),
-        default=list(CLUSTERS.keys())[0],
-        help="Target OCP cluster (default: %(default)s)",
+        "--sheet",
+        required=True,
+        help="Target worksheet name in Google Sheets (e.g. 'surr sby', 'surr jkt')",
     )
     args = parser.parse_args()
 
-    cluster_config = CLUSTERS[args.cluster]
-    worksheet_name = cluster_config["worksheet_name"]
-    cluster_desc = cluster_config["description"]
+    worksheet_name = args.sheet
 
-    print("Target cluster: {0}".format(cluster_desc))
-    print("Worksheet     : {0}".format(worksheet_name))
+    print("Worksheet: {0}".format(worksheet_name))
     print()
 
     pods = collect_pods()
@@ -527,7 +502,7 @@ def main() -> None:
     sync_to_sheet(worksheet, sheet_data)
     apply_sheet_formatting(worksheet)
 
-    print_summary(cluster_desc, worksheet_name, len(worker_nodes), len(pods))
+    print_summary(worksheet_name, len(worker_nodes), len(pods))
     print("Done.")
 
 
