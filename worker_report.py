@@ -407,7 +407,7 @@ def sync_to_sheet(worksheet: gspread.Worksheet, data: List[List[str]]) -> None:
     try:
         worksheet.clear()
         if data:
-            worksheet.update(range_name="A1", values=data, value_input_option="RAW")
+            worksheet.update("A1", data, value_input_option="RAW")
     except (APIError, GSpreadException) as exc:
         print("Failed to sync data to sheet: {0}".format(exc), file=sys.stderr)
         sys.exit(1)
