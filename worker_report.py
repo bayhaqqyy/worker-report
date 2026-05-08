@@ -44,7 +44,8 @@ SPREADSHEET_ID = "1iU150fVgpwg9zbROho6UjB4p1kufCl7-hJUcnYLbfj8"
 # ---------------------------------------------------------------------------
 EXCLUDE_NS_PATTERN = r"openshift-.*|kube-system|default"
 TOP_N = 10
-TITLE = "Worker Resource Request Analysis - OpenShift"
+DEFAULT_STATUS = "Not Started"
+TOTAL_COLUMNS = 19
 
 
 # ---------------------------------------------------------------------------
@@ -283,68 +284,81 @@ def process_node_data(
 # ---------------------------------------------------------------------------
 # Sheet data builder
 # ---------------------------------------------------------------------------
+def _empty_row() -> List[str]:
+    """Return an empty row with the correct number of columns."""
+    return [""] * TOTAL_COLUMNS
+
+
 def build_sheet_data(
     worker_nodes: List[str],
     pods: List[dict],
     cpu_usage: Dict[Tuple[str, str], float],
     mem_usage: Dict[Tuple[str, str], float],
 ) -> List[List[str]]:
-    """Build the full sheet content as a list of rows matching the CSV layout."""
+    """Build the full sheet content matching the surr sby layout.
+
+    Column layout (A-S):
+      A: empty | B: Namespace | C: Pod | D: CPU Request ( Core )
+      E: CPU Limit ( Core ) | F: Real CPU Usage ( Core )
+      G: CPU Request Tuning | H: CPU Limit Tuning | I: Status
+      J: empty | K: Namespace | L: Pod | M: Memory Request ( MB )
+      N: Memory Limit ( MB ) | O: Real Memory Usage ( MB )
+      P: Memory Request Tuning | Q: Memory Limit Tuning | R: Status
+      S: empty
+    """
     rows: List[List[str]] = []
-    rows.append([TITLE])
-    rows.append([])
 
     for node in worker_nodes:
         top_cpu, top_mem = process_node_data(pods, node, cpu_usage, mem_usage)
 
         # Node header row
-        rows.append(["", node, "", "", "", "", "", node, "", "", "", ""])
-        # Column headers
+        node_row = _empty_row()
+        node_row[1] = node
+        node_row[10] = node
+        rows.append(node_row)
+
+        # Column header row
         rows.append([
             "",
             "Namespace", "Pod",
-            "CPU Request ( Core )", "CPU Limit ( Core )", "Real CPU Usage",
+            "CPU Request ( Core )", "CPU Limit ( Core )",
+            "Real CPU Usage ( Core )",
+            "CPU Request Tuning", "CPU Limit Tuning", "Status",
             "",
             "Namespace", "Pod",
-            "Memory Request ( MB )", "Memory Limit ( MB )", "Real Memory Usage",
+            "Memory Request ( MB )", "Memory Limit ( MB )",
+            "Real Memory Usage ( MB )",
+            "Memory Request Tuning", "Memory Limit Tuning", "Status",
+            "",
         ])
 
+        # Data rows (always TOP_N rows per node)
         for i in range(TOP_N):
-            cpu_ns = ""
-            cpu_pod = ""
-            cpu_req = ""
-            cpu_lim = ""
-            cpu_real = ""
-            mem_ns = ""
-            mem_pod = ""
-            mem_req = ""
-            mem_lim = ""
-            mem_real = ""
+            row = _empty_row()
 
             if i < len(top_cpu):
                 p = top_cpu[i]
-                cpu_ns = p.namespace
-                cpu_pod = p.pod
-                cpu_req = "{0:.3g}".format(p.request)
-                cpu_lim = "{0:.3g}".format(p.limit)
+                row[1] = p.namespace
+                row[2] = p.pod
+                row[3] = "{0:.3g}".format(p.request)
+                row[4] = "{0:.3g}".format(p.limit)
                 usage_val = cpu_usage.get((p.namespace, p.pod))
-                cpu_real = "{0:.3f}".format(usage_val) if usage_val is not None else "-"
+                row[5] = "{0:.3f}".format(usage_val) if usage_val is not None else "-"
+                row[8] = DEFAULT_STATUS
 
             if i < len(top_mem):
                 p = top_mem[i]
-                mem_ns = p.namespace
-                mem_pod = p.pod
-                mem_req = "{0:.0f}".format(p.request)
-                mem_lim = "{0:.0f}".format(p.limit)
+                row[10] = p.namespace
+                row[11] = p.pod
+                row[12] = "{0:.0f}".format(p.request)
+                row[13] = "{0:.0f}".format(p.limit)
                 usage_val = mem_usage.get((p.namespace, p.pod))
-                mem_real = "{0:.0f}".format(usage_val) if usage_val is not None else "-"
+                row[14] = "{0:.0f}".format(usage_val) if usage_val is not None else "-"
+                row[17] = DEFAULT_STATUS
 
-            rows.append([
-                "", cpu_ns, cpu_pod, cpu_req, cpu_lim, cpu_real,
-                "", mem_ns, mem_pod, mem_req, mem_lim, mem_real,
-            ])
+            rows.append(row)
 
-        rows.append([])
+        rows.append(_empty_row())
 
     return rows
 
@@ -395,7 +409,7 @@ def get_or_create_worksheet(
         print("Worksheet '{0}' not found, creating...".format(worksheet_name))
         try:
             return spreadsheet.add_worksheet(
-                title=worksheet_name, rows=500, cols=12,
+                title=worksheet_name, rows=500, cols=TOTAL_COLUMNS,
             )
         except (APIError, GSpreadException) as exc:
             print("Failed to create worksheet: {0}".format(exc), file=sys.stderr)
@@ -403,7 +417,7 @@ def get_or_create_worksheet(
 
 
 def sync_to_sheet(worksheet: gspread.Worksheet, data: List[List[str]]) -> None:
-    """Clear the worksheet and write fresh snapshot data."""
+    """Clear values and write fresh snapshot data, preserving existing formatting."""
     try:
         worksheet.clear()
         if data:
@@ -413,41 +427,99 @@ def sync_to_sheet(worksheet: gspread.Worksheet, data: List[List[str]]) -> None:
         sys.exit(1)
 
 
-def apply_sheet_formatting(worksheet: gspread.Worksheet) -> None:
-    """Apply basic formatting: freeze first row area and auto-filter."""
-    try:
-        worksheet.spreadsheet.batch_update(
-            {
-                "requests": [
-                    {
-                        "updateSheetProperties": {
-                            "properties": {
-                                "sheetId": worksheet.id,
-                                "gridProperties": {"frozenRowCount": 1},
-                            },
-                            "fields": "gridProperties.frozenRowCount",
-                        }
-                    },
-                    {
-                        "repeatCell": {
-                            "range": {
-                                "sheetId": worksheet.id,
-                                "startRowIndex": 0,
-                                "endRowIndex": 1,
-                                "startColumnIndex": 0,
-                                "endColumnIndex": 12,
-                            },
-                            "cell": {
-                                "userEnteredFormat": {
-                                    "textFormat": {"bold": True},
-                                }
-                            },
-                            "fields": "userEnteredFormat.textFormat.bold",
-                        }
-                    },
-                ]
+def apply_sheet_formatting(
+    worksheet: gspread.Worksheet,
+    worker_node_count: int,
+) -> None:
+    """Apply formatting matching the surr sby reference sheet.
+
+    For each worker node block (header + column headers + 10 data + separator = 13 rows):
+    - Bold the node header row and column header row
+    - Set column widths for readability
+    """
+    rows_per_node = TOP_N + 3  # node header + col header + data rows + separator
+    requests: List[dict] = []
+
+    for node_idx in range(worker_node_count):
+        base_row = node_idx * rows_per_node
+        # Bold node header row
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": worksheet.id,
+                    "startRowIndex": base_row,
+                    "endRowIndex": base_row + 1,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": TOTAL_COLUMNS,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {"bold": True},
+                    }
+                },
+                "fields": "userEnteredFormat.textFormat.bold",
             }
-        )
+        })
+        # Bold column header row
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": worksheet.id,
+                    "startRowIndex": base_row + 1,
+                    "endRowIndex": base_row + 2,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": TOTAL_COLUMNS,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "textFormat": {"bold": True},
+                    }
+                },
+                "fields": "userEnteredFormat.textFormat.bold",
+            }
+        })
+
+    # Column widths: narrow for separators (A, J, S), wider for data columns
+    col_widths = [
+        (0, 30),    # A: separator
+        (1, 200),   # B: Namespace
+        (2, 280),   # C: Pod
+        (3, 120),   # D: CPU Request
+        (4, 120),   # E: CPU Limit
+        (5, 120),   # F: Real CPU Usage
+        (6, 120),   # G: CPU Request Tuning
+        (7, 120),   # H: CPU Limit Tuning
+        (8, 100),   # I: Status
+        (9, 30),    # J: separator
+        (10, 200),  # K: Namespace
+        (11, 280),  # L: Pod
+        (12, 130),  # M: Memory Request
+        (13, 130),  # N: Memory Limit
+        (14, 140),  # O: Real Memory Usage
+        (15, 140),  # P: Memory Request Tuning
+        (16, 130),  # Q: Memory Limit Tuning
+        (17, 100),  # R: Status
+        (18, 30),   # S: separator
+    ]
+    for col_index, width in col_widths:
+        requests.append({
+            "updateDimensionProperties": {
+                "range": {
+                    "sheetId": worksheet.id,
+                    "dimension": "COLUMNS",
+                    "startIndex": col_index,
+                    "endIndex": col_index + 1,
+                },
+                "properties": {"pixelSize": width},
+                "fields": "pixelSize",
+            }
+        })
+
+    if not requests:
+        return
+
+    try:
+        worksheet.spreadsheet.batch_update({"requests": requests})
     except (APIError, GSpreadException) as exc:
         print("Warning: Could not apply formatting: {0}".format(exc), file=sys.stderr)
 
@@ -500,7 +572,7 @@ def main() -> None:
     client = get_gspread_client()
     worksheet = get_or_create_worksheet(client, worksheet_name)
     sync_to_sheet(worksheet, sheet_data)
-    apply_sheet_formatting(worksheet)
+    apply_sheet_formatting(worksheet, len(worker_nodes))
 
     print_summary(worksheet_name, len(worker_nodes), len(pods))
     print("Done.")
