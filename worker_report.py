@@ -44,7 +44,7 @@ SPREADSHEET_ID = "1iU150fVgpwg9zbROho6UjB4p1kufCl7-hJUcnYLbfj8"
 # ---------------------------------------------------------------------------
 EXCLUDE_NS_PATTERN = r"openshift-.*|kube-system|default"
 TOP_N = 10
-TOTAL_COLUMNS = 13
+TOTAL_COLUMNS = 19
 
 
 # ---------------------------------------------------------------------------
@@ -324,10 +324,11 @@ def build_range_updates(
     """Build a list of {range, values} dicts for batch_update.
 
     Only touches the data columns:
-      CPU:    B-F  (Namespace, Pod, Request, Limit, Real Usage)
-      Memory: H-L  (Namespace, Pod, Request, Limit, Real Usage)
+      CPU:    B-F  (cols 1-5)   — Namespace, Pod, Request, Limit, Real Usage
+      Memory: K-O  (cols 10-14) — Namespace, Pod, Request, Limit, Real Usage
 
-    Column G is a separator. Headers and formatting are untouched.
+    Tuning columns (G-H / P-Q), Status (I / R), headers, and
+    formatting are left untouched.
     """
     updates: List[dict] = []
 
@@ -379,7 +380,7 @@ def build_range_updates(
             else:
                 mem_rows.append(["", "", "", "", ""])
 
-        mem_range = "H{0}:L{1}".format(data_start, data_start + TOP_N - 1)
+        mem_range = "K{0}:O{1}".format(data_start, data_start + TOP_N - 1)
         updates.append({"range": mem_range, "values": mem_rows})
 
     return updates
