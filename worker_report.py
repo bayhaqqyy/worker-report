@@ -340,11 +340,13 @@ def build_range_updates(
 ) -> List[dict]:
     """Build a list of {range, values} dicts for batch_update.
 
-    Only touches the data columns:
+    Touches the following data columns:
       CPU:    B-F  (Namespace, Pod, Request, Limit, Real Usage)
-      Memory: H-L  (Namespace, Pod, Request, Limit, Real Usage)
+      CPU tuning: G-H (Request Tuning, Limit Tuning)
+      Memory: K-O  (Namespace, Pod, Request, Limit, Real Usage)
+      Memory tuning: P-Q (Request Tuning, Limit Tuning)
 
-    Column G is a separator. Headers and formatting are untouched.
+    Headers, Status columns, and formatting are untouched.
     """
     updates: List[dict] = []
 
@@ -379,6 +381,27 @@ def build_range_updates(
         cpu_range = "B{0}:F{1}".format(data_start, data_start + TOP_N - 1)
         updates.append({"range": cpu_range, "values": cpu_rows})
 
+        # --- CPU tuning data (G:H) ---
+        cpu_tuning_rows: List[List[str]] = []
+        for i in range(TOP_N):
+            if i < len(top_cpu):
+                p = top_cpu[i]
+                usage_val = cpu_usage.get((p.namespace, p.pod))
+                if usage_val is not None:
+                    req_tuning = round(usage_val * 10, 3)
+                    lim_tuning = round(req_tuning * 10, 3)
+                    cpu_tuning_rows.append([
+                        "{0:.3g}".format(req_tuning),
+                        "{0:.3g}".format(lim_tuning),
+                    ])
+                else:
+                    cpu_tuning_rows.append(["-", "-"])
+            else:
+                cpu_tuning_rows.append(["", ""])
+
+        cpu_tuning_range = "G{0}:H{1}".format(data_start, data_start + TOP_N - 1)
+        updates.append({"range": cpu_tuning_range, "values": cpu_tuning_rows})
+
         # --- Memory data (K:O) ---
         mem_rows: List[List[str]] = []
         for i in range(TOP_N):
@@ -398,6 +421,27 @@ def build_range_updates(
 
         mem_range = "K{0}:O{1}".format(data_start, data_start + TOP_N - 1)
         updates.append({"range": mem_range, "values": mem_rows})
+
+        # --- Memory tuning data (P:Q) ---
+        mem_tuning_rows: List[List[str]] = []
+        for i in range(TOP_N):
+            if i < len(top_mem):
+                p = top_mem[i]
+                usage_val = mem_usage.get((p.namespace, p.pod))
+                if usage_val is not None:
+                    req_tuning = round(usage_val * 10)
+                    lim_tuning = round(req_tuning * 10)
+                    mem_tuning_rows.append([
+                        "{0:.0f}".format(req_tuning),
+                        "{0:.0f}".format(lim_tuning),
+                    ])
+                else:
+                    mem_tuning_rows.append(["-", "-"])
+            else:
+                mem_tuning_rows.append(["", ""])
+
+        mem_tuning_range = "P{0}:Q{1}".format(data_start, data_start + TOP_N - 1)
+        updates.append({"range": mem_tuning_range, "values": mem_tuning_rows})
 
     return updates
 
@@ -498,10 +542,17 @@ def clear_data_row_highlights(
                             "red": 1.0,
                             "green": 1.0,
                             "blue": 1.0,
+                        },
+                        "textFormat": {
+                            "foregroundColor": {
+                                "red": 0.0,
+                                "green": 0.0,
+                                "blue": 0.0,
+                            }
                         }
                     }
                 },
-                "fields": "userEnteredFormat.backgroundColor",
+                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.foregroundColor",
             }
         })
 
@@ -512,6 +563,98 @@ def clear_data_row_highlights(
         worksheet.spreadsheet.batch_update({"requests": requests})
     except (APIError, GSpreadException) as exc:
         print("Warning: Could not clear highlights: {0}".format(exc), file=sys.stderr)
+
+
+def apply_tuning_highlights(
+    worksheet: gspread.Worksheet,
+    node_rows: Dict[str, int],
+    pods: List[dict],
+    cpu_usage: Dict[Tuple[str, str], float],
+    mem_usage: Dict[Tuple[str, str], float],
+) -> None:
+    """Apply black background + white text on tuning cells that exceed existing values.
+
+    Checks per-cell:
+      CPU:  G (col 6) black if Request Tuning > existing Request
+            H (col 7) black if Limit Tuning > existing Limit
+      Mem:  P (col 15) black if Request Tuning > existing Request
+            Q (col 16) black if Limit Tuning > existing Limit
+    """
+    requests: List[dict] = []
+
+    def _format_cell(sheet_id: int, row_0: int, col_0: int, is_black: bool) -> dict:
+        """Return a repeatCell request for black bg/white text OR white bg/black text."""
+        if is_black:
+            bg_color = {"red": 0.0, "green": 0.0, "blue": 0.0}
+            text_color = {"red": 1.0, "green": 1.0, "blue": 1.0}
+        else:
+            bg_color = {"red": 1.0, "green": 1.0, "blue": 1.0}
+            text_color = {"red": 0.0, "green": 0.0, "blue": 0.0}
+
+        return {
+            "repeatCell": {
+                "range": {
+                    "sheetId": sheet_id,
+                    "startRowIndex": row_0,
+                    "endRowIndex": row_0 + 1,
+                    "startColumnIndex": col_0,
+                    "endColumnIndex": col_0 + 1,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": bg_color,
+                        "textFormat": {
+                            "foregroundColor": text_color,
+                        },
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor,userEnteredFormat.textFormat.foregroundColor",
+            }
+        }
+
+    for node, header_row in node_rows.items():
+        # header_row is 1-based; Sheets API uses 0-based
+        data_start_0 = header_row + 1  # 0-based row of first data row
+
+        top_cpu, top_mem = process_node_data(pods, node, cpu_usage, mem_usage)
+
+        # --- CPU tuning highlights (G=col6, H=col7) ---
+        for i, p in enumerate(top_cpu):
+            row_0 = data_start_0 + i
+            usage_val = cpu_usage.get((p.namespace, p.pod))
+            if usage_val is None:
+                continue
+            req_tuning = usage_val * 10
+            lim_tuning = req_tuning * 10
+
+            # G: black if Request Tuning > existing CPU Request, white otherwise
+            requests.append(_format_cell(worksheet.id, row_0, 6, req_tuning > p.request))
+            # H: black if Limit Tuning > existing CPU Limit, white otherwise
+            requests.append(_format_cell(worksheet.id, row_0, 7, lim_tuning > p.limit))
+
+        # --- Memory tuning highlights (P=col15, Q=col16) ---
+        for i, p in enumerate(top_mem):
+            row_0 = data_start_0 + i
+            usage_val = mem_usage.get((p.namespace, p.pod))
+            if usage_val is None:
+                continue
+            req_tuning = usage_val * 10
+            lim_tuning = req_tuning * 10
+
+            # P: black if Request Tuning > existing Memory Request, white otherwise
+            requests.append(_format_cell(worksheet.id, row_0, 15, req_tuning > p.request))
+            # Q: black if Limit Tuning > existing Memory Limit, white otherwise
+            requests.append(_format_cell(worksheet.id, row_0, 16, lim_tuning > p.limit))
+
+    if not requests:
+        return
+
+    try:
+        worksheet.spreadsheet.batch_update({"requests": requests})
+    except (APIError, GSpreadException) as exc:
+        print("Warning: Could not apply tuning highlights: {0}".format(exc), file=sys.stderr)
+
+
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
@@ -573,8 +716,13 @@ def main() -> None:
     updates = build_range_updates(
         worker_nodes, node_rows, pods, cpu_usage, mem_usage,
     )
-    sync_data_only(worksheet, updates)
+
+    # 1. Clear all data row backgrounds to white first
     clear_data_row_highlights(worksheet, node_rows)
+    # 2. Write data + tuning values
+    sync_data_only(worksheet, updates)
+    # 3. Apply black highlighting on tuning cells that exceed existing values
+    apply_tuning_highlights(worksheet, node_rows, pods, cpu_usage, mem_usage)
 
     print_summary(worksheet_name, len(worker_nodes), len(pods))
     print("Done.")
