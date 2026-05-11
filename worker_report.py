@@ -239,6 +239,9 @@ def process_node_data(
 
     cpu_pods: List[PodResource] = []
     mem_pods: List[PodResource] = []
+    
+    seen_cpu = set()
+    seen_mem = set()
 
     for pod in pods:
         metadata = pod.get("metadata", {})
@@ -274,10 +277,19 @@ def process_node_data(
             total_mem_req += parse_memory_mb(requests.get("memory", "0"))
             total_mem_lim += parse_memory_mb(limits.get("memory", "0"))
 
+        # Extract base name to group replicas
+        # Removes typical 5-character hash (ReplicaSet) or digit (StatefulSet) suffix
+        base_name = re.sub(r'-([a-z0-9]{5}|\d+)$', '', pod_name)
+        unique_key = (ns, base_name)
+
         if total_cpu_req > 0:
-            cpu_pods.append(PodResource(ns, pod_name, total_cpu_req, total_cpu_lim))
+            if unique_key not in seen_cpu:
+                seen_cpu.add(unique_key)
+                cpu_pods.append(PodResource(ns, pod_name, total_cpu_req, total_cpu_lim))
         if total_mem_req > 0:
-            mem_pods.append(PodResource(ns, pod_name, total_mem_req, total_mem_lim))
+            if unique_key not in seen_mem:
+                seen_mem.add(unique_key)
+                mem_pods.append(PodResource(ns, pod_name, total_mem_req, total_mem_lim))
 
     cpu_pods.sort(key=lambda p: p.request, reverse=True)
     mem_pods.sort(key=lambda p: p.request, reverse=True)
