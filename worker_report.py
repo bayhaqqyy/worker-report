@@ -44,8 +44,7 @@ SPREADSHEET_ID = "1iU150fVgpwg9zbROho6UjB4p1kufCl7-hJUcnYLbfj8"
 # ---------------------------------------------------------------------------
 EXCLUDE_NS_PATTERN = r"openshift-.*|kube-system|default"
 TOP_N = 10
-DEFAULT_STATUS = "Not Started"
-TOTAL_COLUMNS = 19
+TOTAL_COLUMNS = 13
 
 
 # ---------------------------------------------------------------------------
@@ -287,85 +286,108 @@ def process_node_data(
 
 
 # ---------------------------------------------------------------------------
-# Sheet data builder
+# Sheet data builder — data-only (no headers / formatting)
 # ---------------------------------------------------------------------------
-def _empty_row() -> List[str]:
-    """Return an empty row with the correct number of columns."""
-    return [""] * TOTAL_COLUMNS
+def _col_letter(index: int) -> str:
+    """Convert a 0-based column index to a Sheets column letter (A, B, … Z, AA …)."""
+    result = ""
+    while True:
+        result = chr(ord("A") + index % 26) + result
+        index = index // 26 - 1
+        if index < 0:
+            break
+    return result
 
 
-def build_sheet_data(
+def find_node_rows(
+    worksheet: gspread.Worksheet,
     worker_nodes: List[str],
+) -> Dict[str, int]:
+    """Read column B from the sheet and return {node_name: 1-based_row} for each node header."""
+    try:
+        col_b = worksheet.col_values(2)  # column B, 1-indexed
+    except (APIError, GSpreadException) as exc:
+        print("Failed to read worksheet column B: {0}".format(exc), file=sys.stderr)
+        sys.exit(1)
+
+    node_set = set(worker_nodes)
+    node_rows: Dict[str, int] = {}
+    for idx, value in enumerate(col_b):
+        stripped = value.strip()
+        if stripped in node_set:
+            node_rows[stripped] = idx + 1  # 1-based row number
+    return node_rows
+
+
+def build_range_updates(
+    worker_nodes: List[str],
+    node_rows: Dict[str, int],
     pods: List[dict],
     cpu_usage: Dict[Tuple[str, str], float],
     mem_usage: Dict[Tuple[str, str], float],
-) -> List[List[str]]:
-    """Build the full sheet content matching the surr sby layout.
+) -> List[dict]:
+    """Build a list of {range, values} dicts for batch_update.
 
-    Column layout (A-S):
-      A: empty | B: Namespace | C: Pod | D: CPU Request ( Core )
-      E: CPU Limit ( Core ) | F: Real CPU Usage ( Core )
-      G: CPU Request Tuning | H: CPU Limit Tuning | I: Status
-      J: empty | K: Namespace | L: Pod | M: Memory Request ( MB )
-      N: Memory Limit ( MB ) | O: Real Memory Usage ( MB )
-      P: Memory Request Tuning | Q: Memory Limit Tuning | R: Status
-      S: empty
+    Only touches the data columns:
+      CPU:    B-F  (Namespace, Pod, Request, Limit, Real Usage)
+      Memory: H-L  (Namespace, Pod, Request, Limit, Real Usage)
+
+    Column G is a separator. Headers and formatting are untouched.
     """
-    rows: List[List[str]] = []
+    updates: List[dict] = []
 
     for node in worker_nodes:
+        if node not in node_rows:
+            print("Warning: node '{0}' not found in sheet, skipping.".format(node),
+                  file=sys.stderr)
+            continue
+
+        header_row = node_rows[node]
+        data_start = header_row + 2  # skip node header row + column header row
+
         top_cpu, top_mem = process_node_data(pods, node, cpu_usage, mem_usage)
 
-        # Node header row
-        node_row = _empty_row()
-        node_row[1] = node
-        node_row[10] = node
-        rows.append(node_row)
-
-        # Column header row
-        rows.append([
-            "",
-            "Namespace", "Pod",
-            "CPU Request ( Core )", "CPU Limit ( Core )",
-            "Real CPU Usage ( Core )",
-            "CPU Request Tuning", "CPU Limit Tuning", "Status",
-            "",
-            "Namespace", "Pod",
-            "Memory Request ( MB )", "Memory Limit ( MB )",
-            "Real Memory Usage ( MB )",
-            "Memory Request Tuning", "Memory Limit Tuning", "Status",
-            "",
-        ])
-
-        # Data rows (always TOP_N rows per node)
+        # --- CPU data (B:F) ---
+        cpu_rows: List[List[str]] = []
         for i in range(TOP_N):
-            row = _empty_row()
-
             if i < len(top_cpu):
                 p = top_cpu[i]
-                row[1] = p.namespace
-                row[2] = p.pod
-                row[3] = "{0:.3g}".format(p.request)
-                row[4] = "{0:.3g}".format(p.limit)
                 usage_val = cpu_usage.get((p.namespace, p.pod))
-                row[5] = "{0:.3f}".format(usage_val) if usage_val is not None else "-"
-                row[8] = DEFAULT_STATUS
+                real_str = "{0:.3f}".format(usage_val) if usage_val is not None else "-"
+                cpu_rows.append([
+                    p.namespace,
+                    p.pod,
+                    "{0:.3g}".format(p.request),
+                    "{0:.3g}".format(p.limit),
+                    real_str,
+                ])
+            else:
+                cpu_rows.append(["", "", "", "", ""])
 
+        cpu_range = "B{0}:F{1}".format(data_start, data_start + TOP_N - 1)
+        updates.append({"range": cpu_range, "values": cpu_rows})
+
+        # --- Memory data (K:O) ---
+        mem_rows: List[List[str]] = []
+        for i in range(TOP_N):
             if i < len(top_mem):
                 p = top_mem[i]
-                row[10] = p.namespace
-                row[11] = p.pod
-                row[12] = "{0:.0f}".format(p.request)
-                row[13] = "{0:.0f}".format(p.limit)
                 usage_val = mem_usage.get((p.namespace, p.pod))
-                row[14] = "{0:.0f}".format(usage_val) if usage_val is not None else "-"
-                row[17] = DEFAULT_STATUS
+                real_str = "{0:.0f}".format(usage_val) if usage_val is not None else "-"
+                mem_rows.append([
+                    p.namespace,
+                    p.pod,
+                    "{0:.0f}".format(p.request),
+                    "{0:.0f}".format(p.limit),
+                    real_str,
+                ])
+            else:
+                mem_rows.append(["", "", "", "", ""])
 
-            rows.append(row)
+        mem_range = "H{0}:L{1}".format(data_start, data_start + TOP_N - 1)
+        updates.append({"range": mem_range, "values": mem_rows})
 
-        rows.append(_empty_row())
-
-    return rows
+    return updates
 
 
 # ---------------------------------------------------------------------------
@@ -421,75 +443,40 @@ def get_or_create_worksheet(
             sys.exit(1)
 
 
-def sync_to_sheet(worksheet: gspread.Worksheet, data: List[List[str]]) -> None:
-    """Clear values and write fresh snapshot data, preserving existing formatting."""
+def sync_data_only(
+    worksheet: gspread.Worksheet,
+    updates: List[dict],
+) -> None:
+    """Write only the data cells without touching headers, formatting, or other columns."""
+    if not updates:
+        print("No data to sync.")
+        return
     try:
-        worksheet.clear()
-        if data:
-            worksheet.update("A1", data, value_input_option="RAW")
+        worksheet.batch_update(updates, value_input_option="RAW")
     except (APIError, GSpreadException) as exc:
         print("Failed to sync data to sheet: {0}".format(exc), file=sys.stderr)
         sys.exit(1)
 
 
-def apply_sheet_formatting(
+def clear_data_row_highlights(
     worksheet: gspread.Worksheet,
-    worker_node_count: int,
+    node_rows: Dict[str, int],
 ) -> None:
-    """Apply formatting matching the surr sby reference sheet.
+    """Set white background on all data rows to clear any old highlighting.
 
-    For each worker node block (header + column headers + 10 data + separator = 13 rows):
-    - Bold the node header row and column header row
-    - Set column widths for readability
+    Uses the dynamic node positions from the sheet rather than fixed offsets.
     """
-    rows_per_node = TOP_N + 3  # node header + col header + data rows + separator
     requests: List[dict] = []
 
-    for node_idx in range(worker_node_count):
-        base_row = node_idx * rows_per_node
-        # Bold node header row
+    for node, header_row in node_rows.items():
+        # header_row is 1-based; Sheets API uses 0-based row indices
+        data_start = header_row + 1  # skip node header + column header (0-based)
         requests.append({
             "repeatCell": {
                 "range": {
                     "sheetId": worksheet.id,
-                    "startRowIndex": base_row,
-                    "endRowIndex": base_row + 1,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": TOTAL_COLUMNS,
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "textFormat": {"bold": True},
-                    }
-                },
-                "fields": "userEnteredFormat.textFormat.bold",
-            }
-        })
-        # Bold column header row
-        requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": worksheet.id,
-                    "startRowIndex": base_row + 1,
-                    "endRowIndex": base_row + 2,
-                    "startColumnIndex": 0,
-                    "endColumnIndex": TOTAL_COLUMNS,
-                },
-                "cell": {
-                    "userEnteredFormat": {
-                        "textFormat": {"bold": True},
-                    }
-                },
-                "fields": "userEnteredFormat.textFormat.bold",
-            }
-        })
-        # Data rows: explicit white background (clear any old highlighting)
-        requests.append({
-            "repeatCell": {
-                "range": {
-                    "sheetId": worksheet.id,
-                    "startRowIndex": base_row + 2,
-                    "endRowIndex": base_row + 2 + TOP_N,
+                    "startRowIndex": data_start,
+                    "endRowIndex": data_start + TOP_N,
                     "startColumnIndex": 0,
                     "endColumnIndex": TOTAL_COLUMNS,
                 },
@@ -506,51 +493,13 @@ def apply_sheet_formatting(
             }
         })
 
-    # Column widths: narrow for separators (A, J, S), wider for data columns
-    col_widths = [
-        (0, 30),    # A: separator
-        (1, 200),   # B: Namespace
-        (2, 280),   # C: Pod
-        (3, 120),   # D: CPU Request
-        (4, 120),   # E: CPU Limit
-        (5, 120),   # F: Real CPU Usage
-        (6, 120),   # G: CPU Request Tuning
-        (7, 120),   # H: CPU Limit Tuning
-        (8, 100),   # I: Status
-        (9, 30),    # J: separator
-        (10, 200),  # K: Namespace
-        (11, 280),  # L: Pod
-        (12, 130),  # M: Memory Request
-        (13, 130),  # N: Memory Limit
-        (14, 140),  # O: Real Memory Usage
-        (15, 140),  # P: Memory Request Tuning
-        (16, 130),  # Q: Memory Limit Tuning
-        (17, 100),  # R: Status
-        (18, 30),   # S: separator
-    ]
-    for col_index, width in col_widths:
-        requests.append({
-            "updateDimensionProperties": {
-                "range": {
-                    "sheetId": worksheet.id,
-                    "dimension": "COLUMNS",
-                    "startIndex": col_index,
-                    "endIndex": col_index + 1,
-                },
-                "properties": {"pixelSize": width},
-                "fields": "pixelSize",
-            }
-        })
-
     if not requests:
         return
 
     try:
         worksheet.spreadsheet.batch_update({"requests": requests})
     except (APIError, GSpreadException) as exc:
-        print("Warning: Could not apply formatting: {0}".format(exc), file=sys.stderr)
-
-
+        print("Warning: Could not clear highlights: {0}".format(exc), file=sys.stderr)
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
@@ -593,13 +542,27 @@ def main() -> None:
     print("Found {0} worker nodes, {1} pods".format(len(worker_nodes), len(pods)))
     print()
 
-    sheet_data = build_sheet_data(worker_nodes, pods, cpu_usage, mem_usage)
-
     print("Syncing to Google Sheets...")
     client = get_gspread_client()
     worksheet = get_or_create_worksheet(client, worksheet_name)
-    sync_to_sheet(worksheet, sheet_data)
-    apply_sheet_formatting(worksheet, len(worker_nodes))
+
+    print("Scanning sheet for node positions...")
+    node_rows = find_node_rows(worksheet, worker_nodes)
+    matched = [n for n in worker_nodes if n in node_rows]
+    missing = [n for n in worker_nodes if n not in node_rows]
+    if missing:
+        print("Warning: nodes not found in sheet (skipped): {0}".format(
+            ", ".join(missing)), file=sys.stderr)
+    if not matched:
+        print("Error: none of the worker nodes were found in the sheet.", file=sys.stderr)
+        sys.exit(1)
+    print("Matched {0}/{1} nodes in sheet.".format(len(matched), len(worker_nodes)))
+
+    updates = build_range_updates(
+        worker_nodes, node_rows, pods, cpu_usage, mem_usage,
+    )
+    sync_data_only(worksheet, updates)
+    clear_data_row_highlights(worksheet, node_rows)
 
     print_summary(worksheet_name, len(worker_nodes), len(pods))
     print("Done.")
