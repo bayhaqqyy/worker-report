@@ -253,6 +253,11 @@ def process_node_data(
             continue
 
         pod_name = metadata.get("name", "")
+
+        # Skip deployer pods (OpenShift DeploymentConfig deployers)
+        if pod_name.endswith("-deploy"):
+            continue
+
         containers = spec.get("containers", [])
 
         total_cpu_req = 0.0
@@ -476,6 +481,28 @@ def apply_sheet_formatting(
                     }
                 },
                 "fields": "userEnteredFormat.textFormat.bold",
+            }
+        })
+        # Data rows: explicit white background (clear any old highlighting)
+        requests.append({
+            "repeatCell": {
+                "range": {
+                    "sheetId": worksheet.id,
+                    "startRowIndex": base_row + 2,
+                    "endRowIndex": base_row + 2 + TOP_N,
+                    "startColumnIndex": 0,
+                    "endColumnIndex": TOTAL_COLUMNS,
+                },
+                "cell": {
+                    "userEnteredFormat": {
+                        "backgroundColor": {
+                            "red": 1.0,
+                            "green": 1.0,
+                            "blue": 1.0,
+                        }
+                    }
+                },
+                "fields": "userEnteredFormat.backgroundColor",
             }
         })
 

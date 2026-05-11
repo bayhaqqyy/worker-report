@@ -130,6 +130,7 @@ while read -r NODE; do
     .items[]
     | select(.spec.nodeName == $node)
     | select(.metadata.namespace | test($exclude) | not)
+    | select(.metadata.name | endswith("-deploy") | not)
     | {
         ns: .metadata.namespace,
         pod: .metadata.name,
@@ -167,6 +168,7 @@ while read -r NODE; do
     .items[]
     | select(.spec.nodeName == $node)
     | select(.metadata.namespace | test($exclude) | not)
+    | select(.metadata.name | endswith("-deploy") | not)
     | {
         ns: .metadata.namespace,
         pod: .metadata.name,
