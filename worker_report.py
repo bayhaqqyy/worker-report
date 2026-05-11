@@ -15,6 +15,8 @@ import json
 import re
 import subprocess
 import sys
+import urllib.request
+import urllib.error
 from typing import Dict, List, Optional, Tuple
 
 import gspread
@@ -38,6 +40,13 @@ SCOPES = [
 
 SERVICE_ACCOUNT_FILE = "/home/ADMINISTRATOR/ivtsvc/worker-report/service-account.json"
 SPREADSHEET_ID = "1iU150fVgpwg9zbROho6UjB4p1kufCl7-hJUcnYLbfj8"
+
+# ---------------------------------------------------------------------------
+# Telegram configuration
+# ---------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN = "8750368629:AAEBUgFkTbymRKwp-rnx3vAeAjr-Hv_Uckg"
+TELEGRAM_CHAT_ID = "1319318293"
+
 
 # ---------------------------------------------------------------------------
 # Collection parameters
@@ -384,7 +393,7 @@ def build_range_updates(
             else:
                 mem_rows.append(["", "", "", "", ""])
 
-        mem_range = "H{0}:L{1}".format(data_start, data_start + TOP_N - 1)
+        mem_range = "K{0}:O{1}".format(data_start, data_start + TOP_N - 1)
         updates.append({"range": mem_range, "values": mem_rows})
 
     return updates
@@ -456,6 +465,80 @@ def sync_data_only(
     except (APIError, GSpreadException) as exc:
         print("Failed to sync data to sheet: {0}".format(exc), file=sys.stderr)
         sys.exit(1)
+
+
+def check_for_changes(
+    worksheet: gspread.Worksheet,
+    updates: List[dict],
+) -> bool:
+    """Check if the new data differs from the existing data, ignoring 'Real Usage'."""
+    if not updates:
+        return False
+
+    ranges = [u["range"] for u in updates]
+    try:
+        old_data_list = worksheet.batch_get(ranges)
+    except (APIError, GSpreadException) as exc:
+        print("Warning: Failed to fetch old data for comparison: {0}".format(exc), file=sys.stderr)
+        return True  # If we can't check, assume there are changes to be safe
+
+    # batch_get might return fewer ranges if some are completely empty,
+    # but typically it returns a list of value lists matching the ranges.
+    if len(old_data_list) != len(updates):
+        return True
+
+    for new_update, old_range_values in zip(updates, old_data_list):
+        new_values = new_update["values"]
+        
+        # Compare row by row
+        for i in range(TOP_N):
+            new_row = new_values[i] if i < len(new_values) else []
+            old_row = old_range_values[i] if i < len(old_range_values) else []
+
+            # We only care about the first 4 columns: Namespace, Pod, Request, Limit.
+            # Index 4 is Real Usage, which fluctuates.
+            new_core = new_row[:4]
+            old_core = old_row[:4]
+            
+            # Pad with empty strings if necessary (e.g. if old row was empty)
+            new_core += [""] * (4 - len(new_core))
+            old_core += [""] * (4 - len(old_core))
+
+            if new_core != old_core:
+                return True
+
+    return False
+
+
+def send_telegram_alert(worksheet: gspread.Worksheet, worksheet_name: str) -> None:
+    """Send an alert to Telegram that the report has changed."""
+    print("Significant changes detected. Sending Telegram alert...")
+    
+    # Construct the sheet URL dynamically using the worksheet's GID
+    sheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/edit#gid={worksheet.id}"
+    
+    message = (
+        f"🚨 <b>Worker Node Report Update</b> 🚨\n\n"
+        f"Ada perubahan pada konfigurasi (Top 10 Pods, Request, atau Limit) di sheet: <b>{worksheet_name}</b>\n\n"
+        f"Silakan periksa Google Sheet untuk melihat perubahannya:\n"
+        f"<a href='{sheet_url}'>Lihat Laporan {worksheet_name.upper()}</a>"
+    )
+    
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    data = json.dumps({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "parse_mode": "HTML"
+    }).encode("utf-8")
+    
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    
+    try:
+        with urllib.request.urlopen(req) as response:
+            if response.status != 200:
+                print(f"Warning: Failed to send Telegram message. Status: {response.status}", file=sys.stderr)
+    except Exception as exc:
+        print(f"Warning: Exception while sending Telegram message: {exc}", file=sys.stderr)
 
 
 def clear_data_row_highlights(
@@ -561,6 +644,13 @@ def main() -> None:
     updates = build_range_updates(
         worker_nodes, node_rows, pods, cpu_usage, mem_usage,
     )
+
+    print("Checking for significant changes...")
+    if check_for_changes(worksheet, updates):
+        send_telegram_alert(worksheet, worksheet_name)
+    else:
+        print("No significant changes detected. Skipping Telegram alert.")
+
     sync_data_only(worksheet, updates)
     clear_data_row_highlights(worksheet, node_rows)
 
